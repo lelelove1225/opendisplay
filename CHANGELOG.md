@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.28.0](https://github.com/peetzweg/opendisplay/compare/v1.27.0...v1.28.0) (2026-10-24)
+
+
+### Features
+
+* connect Android over USB without adb ([#225](https://github.com/peetzweg/opendisplay/issues/225)) ([e8a7f0f](https://github.com/peetzweg/opendisplay/commit/e8a7f0fee2b260f3ac18462f1e788ab9dc7b7072))
+
+
+### Bug Fixes
+
+* **linux:** give the receiver's cursor sprite a transparent background ([#386](https://github.com/peetzweg/opendisplay/issues/386)) ([b9c5aca](https://github.com/peetzweg/opendisplay/commit/b9c5aca08eb8782e564fd02e9bc1e18bfef2a710))
+
 ## [1.27.0](https://github.com/peetzweg/opendisplay/compare/v1.26.0...v1.27.0) (2026-10-24)
 
 
