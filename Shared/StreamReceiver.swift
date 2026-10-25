@@ -115,6 +115,10 @@ final class StreamReceiver: ObservableObject {
     /// Called on the main thread once a power action passed the gate.
     var onPowerAction: ((PowerAction) -> Void)?
     private var cursorSequence = CursorSequenceWindow()
+    private var videoAssembler: DeadlineVideoAssembler?
+    private var videoDatagramTimer: DispatchSourceTimer?
+    private var videoDatagramRecoveries = 0
+    private var staleVideoDatagrams = 0
     // Cursor channel health for the HUD/stats: how many positions landed and
     // how many datagrams never did (sequence gaps + reordered drops). A
     // stuttering pointer with a healthy count means the drawing side; a low
@@ -562,6 +566,7 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func stopCursorListener() {
+        stopVideoDatagrams()
         cursorConnection?.cancel()
         cursorConnection = nil
         cursorListener?.cancel()
@@ -586,6 +591,13 @@ final class StreamReceiver: ObservableObject {
     /// reorder, and a stale position after a fresh one reads as jitter, so
     /// anything at or below the last seen sequence is dropped.
     private func handleCursorDatagram(_ data: Data) {
+        if data.starts(with: VideoDatagrams.magic) {
+            guard videoAssembler != nil else { return }
+            bytesThisWindow += data.count
+            let frames = videoAssembler!.receive(data, at: ProcessInfo.processInfo.systemUptime)
+            for frame in frames { handleAnnexB(frame.data, fromDatagram: true, datagramIsSync: frame.sync) }
+            return
+        }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               obj["type"] as? String == "cursor",
               let seq = (obj["s"] as? NSNumber)?.uint64Value else { return }
@@ -812,6 +824,29 @@ final class StreamReceiver: ObservableObject {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String else { return }
         switch type {
+        case "videoUDPStart":
+            guard let token = obj["flow"] as? String, UUID(uuidString: token) != nil,
+                  let codec = obj["codec"] as? String,
+                  codec == "h264" || (codec == "hevc" && hevcCapability != nil),
+                  cursorListenerReady, cursorConnection != nil else { return }
+            stopVideoDatagrams()
+            // This ordered TCP barrier follows all old TCP video. The sender
+            // waits for Ready before sending any UDP pictures.
+            streamCodec = codec
+            formatDesc = nil; vps = nil; sps = nil; pps = nil
+            decodeAdmission.invalidate()
+            videoAssembler = DeadlineVideoAssembler(token: token)
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + .milliseconds(8), repeating: .milliseconds(8))
+            timer.setEventHandler { [weak self] in self?.pollVideoDatagrams() }
+            timer.resume()
+            videoDatagramTimer = timer
+            Log.info("deadline UDP video ready: \(codec)")
+            sendControl(["type": "videoUDPReady", "flow": token])
+        case "videoUDPStop":
+            stopVideoDatagrams()
+            decodeAdmission.invalidate()
+            Log.info("deadline UDP video stopped — returning to TCP")
         case "pong":
             guard let t1 = obj["t"] as? Double, let mt = obj["mt"] as? Double else { return }
             let t2 = nowMs
@@ -927,6 +962,9 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func resetStreamState() {
+        stopVideoDatagrams()
+        videoDatagramRecoveries = 0
+        staleVideoDatagrams = 0
         buffer.removeAll(keepingCapacity: true)
         formatDesc = nil
         streamCodec = "h264"
@@ -949,6 +987,32 @@ final class StreamReceiver: ObservableObject {
         }
         decodeWindow.removeAll(keepingCapacity: true)
         photonWindow.removeAll(keepingCapacity: true)
+    }
+
+    private func stopVideoDatagrams() {
+        videoDatagramTimer?.cancel()
+        videoDatagramTimer = nil
+        videoAssembler = nil
+    }
+
+    private func sendVideoFeedback(_ object: [String: Any]) {
+        guard let conn = cursorConnection,
+              let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        conn.send(content: data, completion: .contentProcessed { _ in })
+    }
+
+    private func pollVideoDatagrams() {
+        guard videoAssembler != nil else { return }
+        let feedback = videoAssembler!.poll(at: ProcessInfo.processInfo.systemUptime)
+        let token = videoAssembler!.token
+        for nack in feedback.missing {
+            sendVideoFeedback(["type": "videoNack", "flow": token,
+                               "seq": nack.sequence, "missing": nack.indices])
+        }
+        if feedback.recover {
+            videoDatagramRecoveries += 1
+            sendVideoFeedback(["type": "videoRecover", "flow": token])
+        }
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -990,7 +1054,10 @@ final class StreamReceiver: ObservableObject {
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
         let announcesCursorPort = includeCursorPort && cursorListenerReady
-        if announcesCursorPort { hello["cursorPort"] = Int(cursorPort) }
+        if announcesCursorPort {
+            hello["cursorPort"] = Int(cursorPort)
+            hello["videoDatagrams"] = VideoDatagrams.version
+        }
         // Additive: decode ceiling (PROTOCOL.md 6.5) — ask for the full
         // desktop but a stream no larger than this machine can decode.
         if let maxEncodeWide, let maxEncodeHigh {
@@ -1163,7 +1230,8 @@ final class StreamReceiver: ObservableObject {
 
     // MARK: - Annex B -> CMSampleBuffer
 
-    private func handleAnnexB(_ data: Data) {
+    private func handleAnnexB(_ data: Data, fromDatagram: Bool = false,
+                              datagramIsSync: Bool = false) {
         // Pure JSON payload = control message (pong, cursor sprite etc.).
         // Video frames also begin with '{' (telemetry prefix) but always
         // contain start codes — the null bytes make them unambiguous even
@@ -1172,6 +1240,10 @@ final class StreamReceiver: ObservableObject {
             handleVideoChannelJSON(data)
             return
         }
+
+        // After the TCP start barrier, only the negotiated UDP flow carries
+        // video until an ordered stop barrier. Control JSON still uses TCP.
+        if videoAssembler != nil && !fromDatagram { return }
 
         // Split on 4-byte start codes (our sender only emits 00 00 00 01).
         // Bytes before the FIRST start code are the telemetry prefix
@@ -1212,8 +1284,26 @@ final class StreamReceiver: ObservableObject {
         // Receipt = parsed and submitted (or deliberately skipped), not a
         // promise that these pixels have reached the panel. This reverse TCP
         // direction is independent of the Mac's video send queue.
-        defer { if let receipt { sendControl(receipt) } }
+        defer {
+            if let receipt {
+                if fromDatagram { sendVideoFeedback(receipt) }
+                else { sendControl(receipt) }
+            }
+        }
 
+        if fromDatagram, let sendMs, let offset = clockOffsetMs {
+            let age = nowMs + offset - sendMs
+            let deadline = (datagramIsSync ? VideoDatagrams.syncDeadline : VideoDatagrams.deadline) * 1000
+            if age > deadline {
+                // These bytes may already have been queued in the OS/radio
+                // when the sender abandoned them. Do not display stale pixels
+                // just because every fragment eventually arrived.
+                staleVideoDatagrams += 1
+                decodeAdmission.invalidate()
+                requestKeyframeIfNeeded()
+                return
+            }
+        }
         var vclNALUs: [Data] = []
         for nalu in nalus {
             guard let first = nalu.first else { continue }
@@ -1515,6 +1605,9 @@ final class StreamReceiver: ObservableObject {
                     "hitch": stats.hitches,
                     "codec": stats.codec,
                     "decodeBackpressureDrops": videoBackpressureDrops,
+                    "udpRecoveries": videoDatagramRecoveries,
+                    "udpStaleDrops": staleVideoDatagrams,
+                    "videoTransport": videoAssembler == nil ? "tcp" : "udp",
                 ])
                 e2eWindow.removeAll(keepingCapacity: true)
                 encodeWindow.removeAll(keepingCapacity: true)

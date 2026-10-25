@@ -745,10 +745,77 @@ with the existing rate limit. It never feeds P-frames that reference a skipped
 frame. `decodeBackpressureDrops` in `stats` counts these skips; sender logs add
 `ackFlight`, `ackMs`, and the target `bitrate` for diagnostics.
 
-Video still uses TCP: this policy bounds application backlog but cannot
-eliminate retransmission head-of-line blocking or radio outages. Cursor
-positions use the existing independent UDP channel, with a 100 ms refresh
-of the final position/visibility to recover from a lost final datagram.
+This receipt policy also supplies the adaptive bitrate/credit accounting for
+UDP video below. TCP remains the compatibility fallback. Cursor positions use
+the existing independent UDP channel, with a 100 ms refresh of the final
+position/visibility to recover from a lost final datagram.
+
+### 6.9 Deadline-limited UDP video (fork extension, additive)
+
+A receiver with a ready cursor listener may also advertise
+`"videoDatagrams":1`. Fast/WiFi senders may use it only after `cursorAck`
+confirms the UDP flow. No additional public listener is opened.
+
+The sender sends `{"type":"videoUDPStart","flow":"<UUID>","codec":"hevc"}`
+(or `h264`) on TCP, then stops video submission until the receiver echoes
+`{"type":"videoUDPReady","flow":"<UUID>"}`. This TCP barrier follows all
+previous TCP video and selects the codec before UDP data can arrive. After the
+barrier, the receiver ignores TCP video but continues handling TCP control.
+The first UDP picture must be a sync frame including the parameter sets.
+Rotation/reconfiguration uses a fresh token and barrier. Old tokens are
+ignored; tokens separate sessions, they do not authenticate or encrypt them.
+
+Each video UDP datagram is at most 1200 bytes. All integers are big-endian:
+
+| Byte offset | Size | Field |
+|---|---|---|
+| 0 | 4 | ASCII `ODV1` |
+| 4 | 36 | Canonical ASCII UUID matching the negotiated flow |
+| 40 | 8 | Frame sequence, matching the telemetry prefix `seq` |
+| 48 | 4 | Whole payload byte count, 1..1048576 |
+| 52 | 2 | Zero-based fragment index |
+| 54 | 2 | Fragment count, exactly ceil(payload bytes / 1140) |
+| 56 | 1 | 1 for sync frame, 0 otherwise |
+| 57 | 3 | Reserved, all zero |
+| 60 | 1..1140 | Fragment of the existing telemetry + Annex B payload |
+
+The last fragment has exactly the remaining payload length; all other
+fragments are 1140 bytes. Invalid sizes/counts, foreign tokens and old
+sequences are rejected before allocation. At most three partial frames are
+held on the receiver. Completed dependent frames are delivered in sequence;
+a complete newer sync frame may supersede missing older frames immediately.
+
+`frameAck` travels as unframed JSON on the reverse UDP flow after reassembly
+and display submission/skip. For incomplete frames, the receiver requests
+`{"type":"videoNack","flow":"<UUID>","seq":42,"missing":[1,7]}` after
+8 ms, no more frequently than every 12 ms. Requests contain at most 64 indices.
+Retransmissions use the same paced queue, with at most one frame's worth of
+retry packets per frame. The sender keeps two frames at most and submits no
+more than three datagrams per millisecond (28.8 Mbps peak), with at most eight
+local sends pending; adaptive bitrate limits the average video rate.
+
+An unacknowledged delta frame expires 80 ms after submission; a sync frame
+has 250 ms. While a sync frame is unacknowledged, no dependent frame is encoded.
+This avoids repeatedly replacing recovery pictures during a radio stall.
+After expiry the sender discards the dependent chain, releases its credits,
+reduces bitrate, and encodes a sync frame from the latest captured pixels.
+VideoToolbox rate-control drops preserve the sync request and retry the latest
+pixels; a no-error/nil output is not treated as a dead encoder.
+The receiver uses the same 80/250 ms budgets from first fragment arrival,
+and, once clock synchronization is available, rejects completely reassembled
+pictures older than their send-time budget as well. Such skips are counted as
+`udpStaleDrops`, so low delivered-frame latency cannot hide missing pictures.
+It rejects dependent frames until a sync frame completes, and requests
+`{"type":"videoRecover","flow":"<UUID>"}` at most every 100 ms while
+waiting. No recovery requests are sent before the first UDP video packet.
+
+If negotiation takes over one second, or active UDP video produces no valid
+receipt for two seconds, the sender sends `{"type":"videoUDPStop"}` on TCP
+and falls back to bounded TCP with a fresh keyframe for the rest of that
+connection. Idle time alone does not trigger fallback. Reconnect starts a
+fresh negotiation. Receiver `stats` includes `videoTransport` and
+`udpRecoveries`; sender logs include `udpExpired`. These deadlines bound app
+queues, not physical radio outages or packets already inside the OS/network.
 
 ## 7. Coordinate spaces and units
 

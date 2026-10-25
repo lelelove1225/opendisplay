@@ -83,6 +83,11 @@ struct InteractiveVideoFlow {
         return now - oldest.sentAt > 2
     }
 
+    mutating func abandon(at now: Double) {
+        outstanding.removeAll()
+        reduce(at: now)
+    }
+
     private mutating func reduce(at now: Double) {
         healthySince = nil
         healthyACKs = 0

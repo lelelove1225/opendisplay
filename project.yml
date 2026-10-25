@@ -161,6 +161,7 @@ targets:
       - Mac/InteractiveVideoFlow.swift
       - Shared/CursorSequenceWindow.swift
       - Shared/VideoDecodeAdmission.swift
+      - Shared/VideoDatagrams.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift

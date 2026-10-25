@@ -134,6 +134,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var videoFlow = InteractiveVideoFlow()
     private var videoFeedbackTimer: DispatchSourceTimer?
     private var appliedVideoBitrate = 0
+    private var udpVideoWindow = DeadlineVideoSendWindow()
+    private var udpVideoToken: String?
+    private var udpVideoReady = false
+    private var udpVideoNeedsSync = true
+    private var udpVideoFallback = false
+    private var udpVideoGeneration: UInt64 = 0
+    private var udpVideoTimer: DispatchSourceTimer?
+    private var udpVideoStartedAt: Double = 0
+    private var lastUDPVideoReceipt: Double = 0
+    private var lastUDPVideoSubmission: Double = 0
+    private var udpVideoPendingPackets = 0
+    private var udpVideoExpired = 0
+    private var waitingForUDPVideo: Bool { udpVideoToken != nil && !udpVideoReady }
+
     private let pipelineLock = NSLock()
     private var dropsEncThisWindow = 0
     private var dropsNetThisWindow = 0
@@ -1649,6 +1663,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Bookkeeping shared by both transports once a connection is live.
     private func becomeReady(_ conn: NWConnection) {
         resetVideoFlow()
+        udpVideoFallback = false
+        udpVideoExpired = 0
         pendingSends = 0 // completions from retired sockets are ignored
         currentPathUsesWiFi = false
         Log.info("connection ready to \(endpointName)")
@@ -2331,6 +2347,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             switch state {
             case .ready:
                 Log.info("cursor channel ready: udp \(host):\(udpPort)")
+                self.receiveVideoFeedback(on: udp)
                 // Probe immediately: positions only flow while the cursor is
                 // on the captured display, which can be minutes away — the
                 // ack round-trip must not wait for that.
@@ -2467,16 +2484,36 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                   let sequence = (obj["seq"] as? NSNumber)?.uint64Value,
                   videoFlow.acknowledge(token: token, sequence: sequence,
                                         at: ProcessInfo.processInfo.systemUptime) else { return }
+            if udpVideoReady, token == udpVideoToken {
+                udpVideoWindow.acknowledge(sequence)
+                lastUDPVideoReceipt = ProcessInfo.processInfo.systemUptime
+            }
             applyVideoBitrate()
             // Do not wait for another changed capture: it may have been the
             // final scroll position. Resume the cached latest frame promptly.
             if dropReplayTimer != nil { replayLastFrameAfterDrop() }
+        case "videoUDPReady":
+            guard obj["flow"] as? String == udpVideoToken, udpVideoToken != nil else { return }
+            udpVideoReady = true
+            udpVideoNeedsSync = true
+            needsKeyframe = true
+            lastUDPVideoReceipt = ProcessInfo.processInfo.systemUptime
+            Log.info("deadline UDP video active: 80ms delta / 250ms sync expiry, paced fragments")
+            scheduleDropReplayTimer()
+        case "videoNack":
+            guard udpVideoReady, obj["flow"] as? String == udpVideoToken,
+                  let sequence = obj["seq"] as? UInt64,
+                  let missing = obj["missing"] as? [Int] else { return }
+            udpVideoWindow.request(sequence: sequence, missing: missing)
+        case "videoRecover":
+            guard udpVideoReady, obj["flow"] as? String == udpVideoToken else { return }
+            recoverUDPVideo()
         case "stats":
             // Aggregated pipeline health measured on the phone — logged here
             // so one file holds both ends of the story.
             if let json = try? JSONSerialization.data(withJSONObject: obj),
                let line = String(data: json, encoding: .utf8) {
-                Log.info("PHONE-STATS \(line) | mac enc↓=\(dropsEncThisWindow) net↓=\(dropsNetThisWindow) pending=\(pendingSends) ackFlight=\(videoFlow.inFlight) ackMs=\(Int(videoFlow.lastRTT * 1000)) bitrate=\(videoFlow.bitrate)")
+                Log.info("PHONE-STATS \(line) | mac enc↓=\(dropsEncThisWindow) net↓=\(dropsNetThisWindow) pending=\(pendingSends) ackFlight=\(videoFlow.inFlight) ackMs=\(Int(videoFlow.lastRTT * 1000)) bitrate=\(videoFlow.bitrate) udpExpired=\(udpVideoExpired)")
                 dropsEncThisWindow = 0
                 dropsNetThisWindow = 0
             }
@@ -2817,7 +2854,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func isPipelineBackedUp() -> Bool {
         pipelineLock.lock()
         defer { pipelineLock.unlock() }
-        return pendingEncodes >= maxPendingEncodes || pendingSends >= maxPendingSends || videoFlow.blocked
+        return pendingEncodes >= maxPendingEncodes || pendingSends >= maxPendingSends || videoFlow.blocked || waitingForUDPVideo || (udpVideoReady && udpVideoWindow.blocked)
     }
 
     /// Schedule (or reset) a one-shot replay of `lastPixelBuffer` after drops.
@@ -2919,7 +2956,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case "pending_encode":
             drop = pendingEncodes >= maxPendingEncodes
         case "pending_sends":
-            drop = pendingSends >= maxPendingSends || videoFlow.blocked
+            drop = pendingSends >= maxPendingSends || videoFlow.blocked || waitingForUDPVideo || (udpVideoReady && udpVideoWindow.blocked)
         default:
             drop = false
         }
@@ -2953,7 +2990,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let deliveryGeneration = connectionGeneration
         let capturedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         var frameProperties: CFDictionary?
-        if needsKeyframe {
+        let requestedKeyframe = needsKeyframe
+        if requestedKeyframe {
             frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
             needsKeyframe = false
         }
@@ -2970,8 +3008,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             defer {
                 if !deliveryEnqueued { self.finishPendingEncode() }
             }
-            self.noteEncodeResult(succeeded: status == noErr && buffer != nil)
+            // A noErr/nil output is a rate-control drop, not a dead encoder.
+            // In particular, forcing IDRs on a congested link can exhaust the
+            // encoder's bit budget. Preserve the sync request and latest frame.
+            self.noteEncodeResult(succeeded: status == noErr)
             guard status == noErr, let buffer else {
+                self.queue.async { [weak self] in
+                    guard let self, !self.stopped,
+                          self.captureGenerationNow == generation,
+                          self.connectionGeneration == deliveryGeneration else { return }
+                    if requestedKeyframe { self.needsKeyframe = true }
+                    self.scheduleDropReplayTimer()
+                }
+                if status == noErr { return }
                 // A session rejecting every frame looks healthy in all other
                 // counters — the receiver just stays black. Don't be silent.
                 self.pipelineLock.lock()
@@ -2988,7 +3037,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // encode-in-flight until delivery/discard, then becomes a
                 // pending send without an observable backpressure gap.
                 deliveryEnqueued = true
-                self.enqueueFramed(data, capturedAtMs: capturedAtMs, captureGeneration: generation,
+                self.enqueueFramed(data, capturedAtMs: capturedAtMs, isSync: self.isKeyframe(buffer), captureGeneration: generation,
                                    connectionGeneration: deliveryGeneration)
             }
         }
@@ -3236,24 +3285,43 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// socket replacement, `streamConfig`, and the first video payload have a
     /// single total order. Frames encoded for a retired connection are dropped;
     /// `becomeReady` forces the next admitted frame to be an IDR.
-    private func enqueueFramed(_ payload: Data, capturedAtMs: Int64, captureGeneration: UInt64,
+    private func enqueueFramed(_ payload: Data, capturedAtMs: Int64, isSync: Bool, captureGeneration: UInt64,
                                connectionGeneration: UInt64) {
         queue.async { [weak self] in
             guard let self else { return }
             self.finishPendingEncode()
             guard self.captureGenerationNow == captureGeneration,
                   self.connectionGeneration == connectionGeneration else { return }
-            self.sendFramedOnQueue(payload, capturedAtMs: capturedAtMs)
+            self.sendFramedOnQueue(payload, capturedAtMs: capturedAtMs, isSync: isSync)
         }
     }
 
-    private func sendFramedOnQueue(_ annexB: Data, capturedAtMs: Int64) {
+    private func sendFramedOnQueue(_ annexB: Data, capturedAtMs: Int64, isSync: Bool) {
         guard let connection, connectionReady else { return }
         guard peerAcceptsActiveCodec else {
             needsKeyframe = true   // the frame after the confirming hello must be an IDR
             return
         }
+        if udpVideoToken != nil, udpVideoGeneration != captureGenerationNow {
+            // Rotation/rebuild is a new codec reference chain. Retire all old
+            // fragments before negotiating the new format on ordered TCP.
+            stopUDPVideo(announce: true)
+            videoFlow = InteractiveVideoFlow()
+            refreshVideoFlow()
+        }
+        if shouldStartUDPVideo {
+            startUDPVideo()
+            needsKeyframe = true
+            scheduleDropReplayTimer()
+            return
+        }
+        if waitingForUDPVideo || (udpVideoReady && udpVideoNeedsSync && !isSync) {
+            needsKeyframe = true
+            scheduleDropReplayTimer()
+            return
+        }
         var receiptFields = ""
+        var receiptSequence: UInt64?
         if videoFlow.enabled {
             guard let sequence = videoFlow.sent(at: ProcessInfo.processInfo.systemUptime) else {
                 // Defensive only: admission normally happens before encode.
@@ -3262,11 +3330,26 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 scheduleDropReplayTimer()
                 return
             }
+            receiptSequence = sequence
             receiptFields = ",\"flow\":\"\(videoFlow.token)\",\"seq\":\(sequence)"
         }
         let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
         var payload = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs)\(receiptFields)}".utf8)
         payload.append(annexB)
+        if udpVideoReady, let token = udpVideoToken, let sequence = receiptSequence {
+            guard let packets = VideoDatagrams.split(payload, token: token, sequence: sequence, sync: isSync),
+                  udpVideoWindow.insert(packets, sequence: sequence,
+                                        at: ProcessInfo.processInfo.systemUptime) else {
+                recoverUDPVideo()
+                return
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastUDPVideoSubmission > 1 { lastUDPVideoReceipt = now }
+            lastUDPVideoSubmission = now
+            if isSync { udpVideoNeedsSync = false }
+            recordVideoSend(bytes: payload.count)
+            return
+        }
         var header = UInt32(payload.count).bigEndian
         var frame = Data(bytes: &header, count: 4)
         frame.append(payload)
@@ -3278,23 +3361,134 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 Log.info("send error: \(error)")
                 return
             }
-            self.framesSent += 1
-            self.bytesSent += frame.count
-            // Report stats roughly once a second.
-            let elapsed = Date().timeIntervalSince(self.statsWindowStart)
-            if elapsed >= 1.0 {
-                let mbps = Double(self.bytesSent) * 8 / elapsed / 1_000_000
-                let frames = self.framesSent
-                self.bytesSent = 0
-                self.statsWindowStart = Date()
-                Task { @MainActor in self.onStats?(frames, mbps) }
-            }
+            self.recordVideoSend(bytes: frame.count)
         })
+    }
+
+    private func recordVideoSend(bytes: Int) {
+        framesSent += 1
+        bytesSent += bytes
+        let elapsed = Date().timeIntervalSince(statsWindowStart)
+        if elapsed >= 1 {
+            let mbps = Double(bytesSent) * 8 / elapsed / 1_000_000
+            let frames = framesSent
+            bytesSent = 0
+            statsWindowStart = Date()
+            Task { @MainActor in self.onStats?(frames, mbps) }
+        }
+    }
+
+    // MARK: - Deadline-limited UDP video
+
+    private var shouldStartUDPVideo: Bool {
+        #if DEBUG
+        if UserDefaults.standard.bool(forKey: "disableVideoDatagrams") { return false }
+        #endif
+        guard videoFlow.enabled, !udpVideoFallback, udpVideoToken == nil,
+              lastHello?.videoDatagrams == VideoDatagrams.version else { return false }
+        cursorNetworkLock.lock()
+        defer { cursorNetworkLock.unlock() }
+        return cursorChannelConfirmed && cursorConnectionReady && cursorConnection != nil
+    }
+
+    private func startUDPVideo() {
+        guard let codec = activeStreamConfigurationSnapshot?.codec else { return }
+        udpVideoToken = videoFlow.token
+        udpVideoGeneration = captureGenerationNow
+        udpVideoStartedAt = ProcessInfo.processInfo.systemUptime
+        lastUDPVideoReceipt = udpVideoStartedAt
+        sendJSONFrame("{\"type\":\"videoUDPStart\",\"flow\":\"\(videoFlow.token)\",\"codec\":\"\(codec)\"}")
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        // 3 x 1200 bytes/ms is a peak of 28.8 Mbps, with the adaptive encoder
+        // limiting the average. Bound local socket work as well as frame count.
+        timer.schedule(deadline: .now() + .milliseconds(1), repeating: .milliseconds(1),
+                       leeway: .microseconds(250))
+        timer.setEventHandler { [weak self] in self?.pumpUDPVideo() }
+        timer.resume()
+        udpVideoTimer = timer
+    }
+
+    private func stopUDPVideo(announce: Bool) {
+        if announce, udpVideoToken != nil {
+            sendJSONFrame("{\"type\":\"videoUDPStop\"}")
+        }
+        udpVideoTimer?.cancel()
+        udpVideoTimer = nil
+        udpVideoWindow = DeadlineVideoSendWindow()
+        udpVideoToken = nil
+        udpVideoReady = false
+        udpVideoNeedsSync = true
+        udpVideoPendingPackets = 0
+    }
+
+    private func recoverUDPVideo() {
+        udpVideoExpired += 1
+        udpVideoWindow = DeadlineVideoSendWindow()
+        videoFlow.abandon(at: ProcessInfo.processInfo.systemUptime)
+        udpVideoNeedsSync = true
+        needsKeyframe = true
+        applyVideoBitrate()
+        scheduleDropReplayTimer()
+    }
+
+    private func fallbackUDPVideo() {
+        Log.info("deadline UDP video unavailable — falling back to bounded TCP")
+        stopUDPVideo(announce: true)
+        udpVideoFallback = true
+        videoFlow.abandon(at: ProcessInfo.processInfo.systemUptime)
+        needsKeyframe = true
+        scheduleDropReplayTimer()
+    }
+
+    private func pumpUDPVideo() {
+        guard !stopped, connectionReady, let token = udpVideoToken else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !udpVideoReady {
+            if now - udpVideoStartedAt > 1 { fallbackUDPVideo() }
+            return
+        }
+        if udpVideoWindow.count > 0, now - lastUDPVideoReceipt > 2 {
+            fallbackUDPVideo()
+            return
+        }
+        if udpVideoWindow.expire(at: now) { recoverUDPVideo() }
+        cursorNetworkLock.lock()
+        let udp = cursorConnectionReady ? cursorConnection : nil
+        cursorNetworkLock.unlock()
+        guard let udp else { fallbackUDPVideo(); return }
+        let capacity = min(3, max(0, 8 - udpVideoPendingPackets))
+        for packet in udpVideoWindow.take(maximum: capacity) {
+            udpVideoPendingPackets += 1
+            udp.send(content: packet, completion: .contentProcessed { [weak self] error in
+                guard let self, self.udpVideoToken == token else { return }
+                self.udpVideoPendingPackets = max(0, self.udpVideoPendingPackets - 1)
+                if error != nil { self.fallbackUDPVideo() }
+            })
+        }
+    }
+
+    private func receiveVideoFeedback(on udp: NWConnection) {
+        udp.receiveMessage { [weak self] data, _, _, error in
+            guard let self else { return }
+            self.cursorNetworkLock.lock()
+            let current = self.cursorConnection === udp
+            self.cursorNetworkLock.unlock()
+            guard current, error == nil else { return }
+            if let data, data.count <= 2048,
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let type = obj["type"] as? String,
+               ["frameAck", "videoNack", "videoRecover"].contains(type),
+               obj["flow"] as? String == self.udpVideoToken {
+                self.handleControl(data)
+            }
+            self.receiveVideoFeedback(on: udp)
+        }
     }
 
     // MARK: - Interactive WiFi feedback
 
     private func resetVideoFlow() {
+        stopUDPVideo(announce: false)
         videoFeedbackTimer?.cancel()
         videoFeedbackTimer = nil
         videoFlow = InteractiveVideoFlow()
@@ -3306,6 +3500,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             && lastHello?.frameAck == InteractiveVideoFlow.version
             && currentPathUsesWiFi && quality == .fast
         let wasEnabled = videoFlow.enabled
+        if !enable || lastHello?.videoDatagrams != VideoDatagrams.version {
+            stopUDPVideo(announce: true)
+        }
         videoFlow.configure(enabled: enable, ceiling: baseBitrate > 0 ? baseBitrate : quality.bitrate)
         if enable, videoFeedbackTimer == nil {
             let generation = connectionGeneration
