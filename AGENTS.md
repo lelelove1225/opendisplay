@@ -9,8 +9,9 @@ requirement; changing either creates stale or duplicate permission entries.
 - iOS Debug bundle ID: `com.peetzweg.opensidecar.ios.debug` (`OpenDisplay Dev`),
   installed alongside the App Store receiver. iOS Debug uses TCP 9100 / UDP
   9101 and a `Dev` Bonjour name to avoid the suspended release app holding
-  TCP 9000 / UDP 9001. WiFi discovery carries the port; manual USB testing
-  of the Debug receiver must explicitly use port 9100. Keep personal signing team IDs
+  TCP 9000 / UDP 9001. WiFi discovery carries the port; Debug Mac USB defaults
+  to 9100 through `ReceiverEndpoint`, matching Debug iOS. An explicit `-port`
+  still overrides it. Keep personal signing team IDs
   in local build arguments or `.env`, never in tracked project files.
 - Keep Debug builds separate from the release bundle IDs.
 - Build the sender into `build/Build/Products/Debug/OpenDisplay Dev.app` and
@@ -21,6 +22,10 @@ requirement; changing either creates stale or duplicate permission entries.
   launch the build-tree copy directly, especially if `build` points into `/tmp`.
   Do not rebuild or re-sign it after granting Screen
   Recording during a test session.
+- Build Duo receivers with Xcode 27.1 or newer. Keep `UIRequiresFullScreen`
+  absent: the receiver uses the current window's geometry and must resize
+  across inner/outer displays and Split View. Do not reintroduce cached
+  `UIScreen.main` dimensions or orientation-only size announcements.
 - If the Debug sender's permission row is stale, quit it, run
   `tccutil reset ScreenCapture com.peetzweg.opensidecar.mac.debug`, launch the
   unchanged app, use its Grant button, and restart it once.

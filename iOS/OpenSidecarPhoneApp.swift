@@ -69,7 +69,7 @@ struct ReceiverScreen: View {
     }
 
     var body: some View {
-        GeometryReader { geo in
+        GeometryReader { geometry in
             ZStack {
                 if isStreaming {
                     Color.black.ignoresSafeArea()
@@ -77,7 +77,6 @@ struct ReceiverScreen: View {
                                    receiver: model.receiver,
                                    useMetal: metalRenderer)
                         .id(metalRenderer)   // rebuild the layer tree on toggle
-                        .ignoresSafeArea()
                     if showAnalytics {
                         VStack {
                             Spacer()
@@ -91,15 +90,19 @@ struct ReceiverScreen: View {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
             }
-            .onAppear { model.receiver.setOrientation(portrait: geo.size.height > geo.size.width) }
-            .onChange(of: geo.size) { size in
-                model.receiver.setOrientation(portrait: size.height > size.width)
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(ReceiverViewportReader(onChange: model.updateViewport))
+            // A desktop has controls in all four corners. Fit its rectangle
+            // to the available safe size, then center it on the whole window
+            // rather than letting the home indicator push it towards an edge.
+            .padding(8)
+            .offset(x: isStreaming ? (geometry.safeAreaInsets.trailing - geometry.safeAreaInsets.leading) / 2 : 0,
+                    y: isStreaming ? (geometry.safeAreaInsets.bottom - geometry.safeAreaInsets.top) / 2 : 0)
             .sheet(isPresented: $showOnboarding) {
                 OnboardingView { onboardingDismissed = true }
             }
         }
-        .ignoresSafeArea(edges: isStreaming ? .all : [])
+        .background(Color.black.ignoresSafeArea())
         .statusBarHidden(isStreaming)
         .systemOverlaysHidden(isStreaming)
         .sheet(isPresented: $showSettings) {
@@ -540,27 +543,24 @@ private struct DeviceNameField: View {
 @MainActor
 final class ReceiverModel: ObservableObject {
     let receiver: StreamReceiver
+    private let decodesHEVC: Bool
     private var started = false
+    private var hasViewport = false
     private var cancellables = Set<AnyCancellable>()
 
     init() {
         // Offer HEVC wherever the hardware decodes it (A9 and later; the A8/A8X
         // iPads stay on H.264). Panels here fit H.264's raster anyway, so HEVC
         // buys quality per bit, which matters most over WiFi. Bounded by the
-        // panel in either orientation, so a large mirrored Mac display is
-        // scaled to what this screen can show instead of sent in full.
-        let native = UIScreen.main.nativeBounds.size   // portrait pixels
-        let longSide = Int(max(native.width, native.height))
+        // current window, which can move between Duo's two displays. The
+        // viewport reader supplies dimensions before the listener starts.
         var decodesHEVC = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
         #if DEBUG
         // The simulator has no hardware decoder; -forceHEVCOffer YES exercises
         // the HEVC receive path there with software decode.
         if UserDefaults.standard.bool(forKey: "forceHEVCOffer") { decodesHEVC = true }
         #endif
-        let hevc = decodesHEVC
-            ? VideoCapability(codec: "hevc", maxWidth: longSide, maxHeight: longSide,
-                              maxFrameRate: 60)
-            : nil
+        self.decodesHEVC = decodesHEVC
         #if DEBUG
         let defaultName = UIDevice.current.name + " Dev"
         #else
@@ -568,13 +568,7 @@ final class ReceiverModel: ObservableObject {
         #endif
         receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(),
                                   deviceKind: deviceKind,
-                                  fallbackServiceName: defaultName,
-                                  hevcCapability: hevc)
-        // Announce the native panel size to the Mac.
-        receiver.setNativePanel(long: Int(max(native.width, native.height)),
-                                short: Int(min(native.width, native.height)),
-                                scale: Double(UIScreen.main.nativeScale))
-        receiver.setDisplayMaxFrameRate(UIScreen.main.maximumFramesPerSecond)
+                                  fallbackServiceName: defaultName)
         if let budget = DecodeBudget.maxPixelsPerSecond(model: DecodeBudget.currentModel) {
             receiver.setDecodeBudget(maxPixelsPerSecond: budget)
         }
@@ -586,17 +580,16 @@ final class ReceiverModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    func updateViewport(_ viewport: ReceiverViewport) {
+        receiver.setViewport(viewport, supportsHEVC: decodesHEVC)
+        hasViewport = true
+        start()
+    }
+
     func start() {
-        guard !started else { return }
+        guard hasViewport, !started else { return }
         started = true
-        #if DEBUG
-        // An App Store receiver can retain its sockets while suspended. The
-        // separate Debug identity also needs separate ports to coexist.
-        // Bonjour carries the port, so WiFi senders discover it automatically.
-        receiver.start(port: 9100)
-        #else
-        receiver.start(port: 9000)
-        #endif
+        receiver.start(port: ReceiverEndpoint.port)
     }
 
     // MARK: - Lock vs app switch vs app quit
@@ -631,6 +624,7 @@ final class ReceiverModel: ObservableObject {
 
     func sceneDidActivate() {
         endBackgroundAssertion()
+        guard started else { return } // wait for the first real window size
         receiver.setRenderingPaused(false)
         receiver.ensureListening()
     }

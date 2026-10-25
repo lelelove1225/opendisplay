@@ -223,7 +223,7 @@ final class SenderController: ObservableObject {
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
-    @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
+    @Published var port = UserDefaults.standard.string(forKey: "port") ?? String(ReceiverEndpoint.port)
     // `-mode mirror` / `-mode extend` launch argument also works.
     // The menu-bar popover and the standalone window both host ContentView.
     // Restart here, once per actual setting change, rather than in each

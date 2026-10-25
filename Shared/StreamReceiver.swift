@@ -307,6 +307,25 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
+    /// iOS window geometry may change without a rotation (Duo fold/unfold or
+    /// Split View). Commit size, display rate and decoder limits together on
+    /// the connection queue, then announce one consistent operating envelope.
+    func setViewport(_ viewport: ReceiverViewport, supportsHEVC: Bool) {
+        queue.async {
+            let longSide = max(viewport.pixelsWide, viewport.pixelsHigh)
+            let hevc = supportsHEVC
+                ? VideoCapability(codec: "hevc", maxWidth: longSide, maxHeight: longSide,
+                                  maxFrameRate: 60)
+                : nil
+            let rateChanged = self.displayMaxFrameRate != viewport.maximumFramesPerSecond
+            self.displayMaxFrameRate = viewport.maximumFramesPerSecond
+            let limitsChanged = self.setDecodeLimits(maxEncodeWide: nil, maxEncodeHigh: nil,
+                                                    hevc: hevc)
+            self.setPanel(pixelsWide: viewport.pixelsWide, pixelsHigh: viewport.pixelsHigh,
+                          scale: viewport.scale, limitsChanged: limitsChanged || rateChanged)
+        }
+    }
+
     func setOrientation(portrait: Bool) {
         guard nativeLong > 0 else { return }
         setPanel(pixelsWide: portrait ? nativeShort : nativeLong,
@@ -315,7 +334,7 @@ final class StreamReceiver: ObservableObject {
     }
 
     /// Announce the panel this receiver renders onto. Called before start()
-    /// and again whenever it changes (iOS rotation via setOrientation, macOS
+    /// and again whenever it changes (iOS content viewport, macOS
     /// display-mode changes) — a live connection re-sends hello so the sender
     /// rebuilds the virtual display for the new dimensions.
     /// `panel` is announced as `hello.panel` when the legacy fields are not
@@ -413,6 +432,10 @@ final class StreamReceiver: ObservableObject {
     func ensureListening() {
         queue.async {
             guard !self.listenerHealthy else { return }
+            // Initial scene activation can follow start() before NWListener
+            // reports ready. Cancelling a binding socket here races its own
+            // replacement and produces a spurious address-in-use failure.
+            if let listener = self.listener, case .setup = listener.state { return }
             Log.info("listener not healthy — restarting")
             self.restartListener()
         }

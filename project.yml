@@ -162,6 +162,7 @@ targets:
       - Shared/CursorSequenceWindow.swift
       - Shared/VideoDecodeAdmission.swift
       - Shared/VideoDatagrams.swift
+      - Shared/ReceiverViewport.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
@@ -196,7 +197,6 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
-        UIRequiresFullScreen: true
         NSLocalNetworkUsageDescription: OpenDisplay advertises itself on the local network so your Mac can connect over WiFi.
         NSBonjourServices: ["_opensidecar._tcp"]
         UISupportedInterfaceOrientations:
