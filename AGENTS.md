@@ -9,7 +9,11 @@ requirement; changing either creates stale or duplicate permission entries.
 - Keep Debug builds separate from the release bundle IDs.
 - Build the sender into `build/Build/Products/Debug/OpenDisplay Dev.app` and
   launch it with `./run.sh`. The script normalizes an ad hoc build's designated
-  requirement before launch. Do not rebuild or re-sign it after granting Screen
+  requirement and installs it at `~/Applications/OpenDisplay Dev.app` before
+  launch. `./run.sh --install-only` prepares that same app without opening it.
+  Quit the running Debug sender before installing a changed build. Do not
+  launch the build-tree copy directly, especially if `build` points into `/tmp`.
+  Do not rebuild or re-sign it after granting Screen
   Recording during a test session.
 - If the Debug sender's permission row is stale, quit it, run
   `tccutil reset ScreenCapture com.peetzweg.opensidecar.mac.debug`, launch the
