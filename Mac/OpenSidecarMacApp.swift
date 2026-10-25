@@ -37,13 +37,16 @@ struct OpenSidecarMacApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // Sparkle's standard updater. `startingUpdater: true` boots the updater
-    // immediately so scheduled background checks (SUEnableAutomaticChecks)
-    // run; the menu item drives manual "Check for Updates…". Held for the
-    // app's lifetime here so every window (menu bar + control window) shares
-    // one updater instance.
+    // Keep local Debug experiments from being replaced by an upstream
+    // release. A stopped updater also disables the manual update button.
+    // Release builds retain their normal automatic updates.
+    #if DEBUG
+    let updater = SPUStandardUpdaterController(
+        startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    #else
     let updater = SPUStandardUpdaterController(
         startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hand the updater to the control window, which is built outside the
