@@ -6,6 +6,12 @@ requirement; changing either creates stale or duplicate permission entries.
 
 - Sender Debug bundle ID: `com.peetzweg.opensidecar.mac.debug`
 - Receiver Debug bundle ID: `com.peetzweg.opensidecar.mac.receiver.debug`
+- iOS Debug bundle ID: `com.peetzweg.opensidecar.ios.debug` (`OpenDisplay Dev`),
+  installed alongside the App Store receiver. iOS Debug uses TCP 9100 / UDP
+  9101 and a `Dev` Bonjour name to avoid the suspended release app holding
+  TCP 9000 / UDP 9001. WiFi discovery carries the port; manual USB testing
+  of the Debug receiver must explicitly use port 9100. Keep personal signing team IDs
+  in local build arguments or `.env`, never in tracked project files.
 - Keep Debug builds separate from the release bundle IDs.
 - Build the sender into `build/Build/Products/Debug/OpenDisplay Dev.app` and
   launch it with `./run.sh`. The script normalizes an ad hoc build's designated

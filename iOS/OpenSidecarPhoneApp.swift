@@ -561,9 +561,14 @@ final class ReceiverModel: ObservableObject {
             ? VideoCapability(codec: "hevc", maxWidth: longSide, maxHeight: longSide,
                               maxFrameRate: 60)
             : nil
+        #if DEBUG
+        let defaultName = UIDevice.current.name + " Dev"
+        #else
+        let defaultName = UIDevice.current.name
+        #endif
         receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(),
                                   deviceKind: deviceKind,
-                                  fallbackServiceName: UIDevice.current.name,
+                                  fallbackServiceName: defaultName,
                                   hevcCapability: hevc)
         // Announce the native panel size to the Mac.
         receiver.setNativePanel(long: Int(max(native.width, native.height)),
@@ -574,7 +579,7 @@ final class ReceiverModel: ObservableObject {
             receiver.setDecodeBudget(maxPixelsPerSecond: budget)
         }
         let savedName = UserDefaults.standard.string(forKey: "deviceName")
-        receiver.serviceName = (savedName?.isEmpty == false) ? savedName! : UIDevice.current.name
+        receiver.serviceName = (savedName?.isEmpty == false) ? savedName! : defaultName
         receiver.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -584,7 +589,14 @@ final class ReceiverModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        #if DEBUG
+        // An App Store receiver can retain its sockets while suspended. The
+        // separate Debug identity also needs separate ports to coexist.
+        // Bonjour carries the port, so WiFi senders discover it automatically.
+        receiver.start(port: 9100)
+        #else
         receiver.start(port: 9000)
+        #endif
     }
 
     // MARK: - Lock vs app switch vs app quit

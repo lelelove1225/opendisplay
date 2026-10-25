@@ -158,6 +158,9 @@ targets:
       - Mac/PhoneInfo.swift
       - Mac/DesktopPolicy.swift
       - Mac/CaptureSourceCheck.swift
+      - Mac/InteractiveVideoFlow.swift
+      - Shared/CursorSequenceWindow.swift
+      - Shared/VideoDecodeAdmission.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
@@ -187,7 +190,7 @@ targets:
     info:
       path: iOS/Info.plist
       properties:
-        CFBundleDisplayName: OpenDisplay
+        CFBundleDisplayName: $(BUNDLE_DISPLAY_NAME)
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -203,5 +206,12 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios
+        PRODUCT_NAME: OpenDisplay
+        BUNDLE_DISPLAY_NAME: OpenDisplay
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios.debug
+          PRODUCT_NAME: OpenDisplay Dev
+          BUNDLE_DISPLAY_NAME: OpenDisplay Dev

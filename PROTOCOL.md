@@ -464,13 +464,15 @@ UDP where a lost or late datagram costs nothing: the next one supersedes it.
   queued behind video can arrive after a newer datagram). The sequence is
   per TCP session: it restarts when the TCP connection is (re-)established
   and runs across both paths. The receiver resets its tracker on every new
-  TCP connection and on every new UDP flow, and accepts datagrams only
-  from the most recently seen flow. A TCP `cursor` frame without `s` (an
+  TCP connection, preserves it across new UDP flows in that session, and
+  accepts datagrams only from the most recently seen flow. A TCP `cursor` frame without `s` (an
   older sender) applies unconditionally.
 * **Delivery confirmation.** `.ready` on a UDP socket proves only a local
   route — a firewalled port would swallow the cursor silently. On the
-  first accepted datagram of a flow the receiver sends `cursorAck` (a
-  control message with no other fields) over TCP. Until it arrives the
+  first well-formed datagram of a flow the receiver sends `cursorAck` (a
+  control message with no other fields) over TCP, even when TCP has already
+  delivered the same or a newer sequence. Delivery confirmation is independent
+  of the position deduplication rule. Until it arrives the
   sender MUST keep mirroring every position onto TCP (same `s`, so the
   receiver deduplicates); if no ack arrives within a few seconds the
   sender SHOULD drop the UDP flow and stay on TCP. A receiver that stops
@@ -692,6 +694,61 @@ change for any of this: `streamConfig` announces the stream.
 
 In mirror sessions `panel` only bounds the stream; the desktop is the
 sender's own display.
+
+### 6.8 Interactive video receipts (fork extension, additive)
+
+A receiver may advertise `"frameAck":1` in `hello`. A sender must not wait
+for receipts unless the current connection advertises this exact version.
+Legacy receivers, USB/cable, and higher-quality presets keep their existing
+behavior. This fork enables the policy for **Fast over WiFi**.
+
+When enabled, the sender adds `flow` (a fresh UUID string per feedback
+session) and `seq` (a positive, strictly increasing integer) to the existing
+video telemetry prefix, before the first Annex B start code:
+
+```json
+{"cap":1234567890000,"snd":1234567890004,"flow":"example-session-token","seq":42}
+```
+
+After parsing and submitting that frame to the display path, the receiver
+replies on the existing reverse TCP channel:
+
+```json
+{"type":"frameAck","flow":"example-session-token","seq":42}
+```
+
+A deliberately skipped frame is also acknowledged (e.g. backgrounded app or
+an overloaded decoder). This is a **receipt**, not a decode-complete or
+on-screen timestamp. TCP preserves order, so receipts are cumulative. The
+sender ignores duplicate/future sequences and mismatched session tokens.
+Re-hello/rotation preserves the window; a new connection gets a fresh token.
+
+The Fast/WiFi policy allows at most two unacknowledged encoded frames. It
+skips captures **before encoding** while full and retains only the newest
+pixel buffer, including the final changed frame when capture goes idle.
+A receipt wakes that replay immediately, subject to the selected frame rate.
+No encoded P-frame is discarded merely to catch up.
+
+The bitrate starts at the smaller of the selected ceiling and 3 Mbps.
+Receipt RTT above 50 ms, or an outstanding receipt older than 80 ms, halves
+it at most once per 500 ms, down to 750 kbps (or the preset ceiling if lower).
+Thirty or more receipts below 25 ms across two healthy seconds allow a slow
+increase, capped at the preset ceiling. Idle time does not raise the rate.
+These are sender-monotonic round trips, requiring no clock synchronization.
+Two seconds without a video receipt redials the socket while retaining the
+virtual display. These thresholds are initial tuning, not measured latency
+guarantees or a substitute for congestion control at the transport layer.
+
+If the receiver's display queue refuses more data, it keeps the last image
+and skips dependent frames until a ready sync frame arrives, requesting `kf`
+with the existing rate limit. It never feeds P-frames that reference a skipped
+frame. `decodeBackpressureDrops` in `stats` counts these skips; sender logs add
+`ackFlight`, `ackMs`, and the target `bitrate` for diagnostics.
+
+Video still uses TCP: this policy bounds application backlog but cannot
+eliminate retransmission head-of-line blocking or radio outages. Cursor
+positions use the existing independent UDP channel, with a 100 ms refresh
+of the final position/visibility to recover from a lost final datagram.
 
 ## 7. Coordinate spaces and units
 
