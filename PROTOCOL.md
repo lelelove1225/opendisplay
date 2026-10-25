@@ -653,8 +653,11 @@ sender can ask it to power off.
 ### 6.7 Panel facts (`hello.panel`)
 
 On iOS, these facts describe the entire receiving window in physical pixels,
-derived from its bounds and its window scene's screen scale. Video extends
-edge to edge; the device's rounded corners can mask desktop corners. They are updated
+derived from its bounds and its window scene's screen scale. By default video
+extends edge to edge; the device's rounded corners can mask desktop corners.
+The optional "Fit entire desktop" setting instead reports the video view's
+safe-area size minus an 8-point margin, centered in the window. Toggling the
+setting updates the announced size on the existing connection. Facts are updated
 when the window moves between iPhone Duo's inner and outer displays, rotates,
 or resizes in Split View. The receiver coalesces animated geometry changes
 before sending one hello with matching panel and decode limits. Do not infer

@@ -2,19 +2,22 @@ import SwiftUI
 import UIKit
 
 /// Observes the hosting window even while the receiver is showing its idle UI.
-/// Video fills the entire window; window bounds handle rotation, inner/outer
-/// displays and Split View without changing when system overlays disappear.
+/// Measures either the edge-to-edge window or the inset video's own bounds,
+/// following rotation, inner/outer displays and Split View in either mode.
 struct ReceiverViewportReader: UIViewRepresentable {
+    var usesFullWindow: Bool
     var onChange: (ReceiverViewport) -> Void
 
     func makeUIView(context: Context) -> ProbeView {
         let view = ProbeView()
         view.isUserInteractionEnabled = false
+        view.usesFullWindow = usesFullWindow
         view.onChange = onChange
         return view
     }
 
     func updateUIView(_ view: ProbeView, context: Context) {
+        view.usesFullWindow = usesFullWindow
         view.onChange = onChange
         view.observeViewport()
     }
@@ -24,6 +27,7 @@ struct ReceiverViewportReader: UIViewRepresentable {
     }
 
     final class ProbeView: UIView {
+        var usesFullWindow = true
         var onChange: ((ReceiverViewport) -> Void)?
         private var lastDelivered: ReceiverViewport?
         private var candidate: ReceiverViewport?
@@ -60,7 +64,7 @@ struct ReceiverViewportReader: UIViewRepresentable {
             guard let window, let scene = window.windowScene else { return nil }
             // Never UIScreen.main: on Duo it can describe the other display.
             let screen = scene.screen
-            return ReceiverViewport(points: window.bounds.size,
+            return ReceiverViewport(points: usesFullWindow ? window.bounds.size : bounds.size,
                                     scale: Double(screen.nativeScale),
                                     maximumFramesPerSecond: screen.maximumFramesPerSecond)
         }
