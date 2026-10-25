@@ -69,7 +69,7 @@ struct ReceiverScreen: View {
     }
 
     var body: some View {
-        GeometryReader { geometry in
+        GeometryReader { _ in
             ZStack {
                 if isStreaming {
                     Color.black.ignoresSafeArea()
@@ -77,6 +77,7 @@ struct ReceiverScreen: View {
                                    receiver: model.receiver,
                                    useMetal: metalRenderer)
                         .id(metalRenderer)   // rebuild the layer tree on toggle
+                        .ignoresSafeArea()
                     if showAnalytics {
                         VStack {
                             Spacer()
@@ -92,12 +93,6 @@ struct ReceiverScreen: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(ReceiverViewportReader(onChange: model.updateViewport))
-            // A desktop has controls in all four corners. Fit its rectangle
-            // to the available safe size, then center it on the whole window
-            // rather than letting the home indicator push it towards an edge.
-            .padding(8)
-            .offset(x: isStreaming ? (geometry.safeAreaInsets.trailing - geometry.safeAreaInsets.leading) / 2 : 0,
-                    y: isStreaming ? (geometry.safeAreaInsets.bottom - geometry.safeAreaInsets.top) / 2 : 0)
             .sheet(isPresented: $showOnboarding) {
                 OnboardingView { onboardingDismissed = true }
             }

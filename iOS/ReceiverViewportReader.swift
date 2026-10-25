@@ -2,8 +2,8 @@ import SwiftUI
 import UIKit
 
 /// Observes the hosting window even while the receiver is showing its idle UI.
-/// The probe shares the video's safe content rectangle, including its margin.
-/// Its bounds handle rotation, inner/outer displays and Split View.
+/// Video fills the entire window; window bounds handle rotation, inner/outer
+/// displays and Split View without changing when system overlays disappear.
 struct ReceiverViewportReader: UIViewRepresentable {
     var onChange: (ReceiverViewport) -> Void
 
@@ -60,7 +60,7 @@ struct ReceiverViewportReader: UIViewRepresentable {
             guard let window, let scene = window.windowScene else { return nil }
             // Never UIScreen.main: on Duo it can describe the other display.
             let screen = scene.screen
-            return ReceiverViewport(points: bounds.size,
+            return ReceiverViewport(points: window.bounds.size,
                                     scale: Double(screen.nativeScale),
                                     maximumFramesPerSecond: screen.maximumFramesPerSecond)
         }
