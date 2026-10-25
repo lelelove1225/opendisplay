@@ -37,13 +37,16 @@ struct OpenSidecarMacApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    // Sparkle's standard updater. `startingUpdater: true` boots the updater
-    // immediately so scheduled background checks (SUEnableAutomaticChecks)
-    // run; the menu item drives manual "Check for Updates…". Held for the
-    // app's lifetime here so every window (menu bar + control window) shares
-    // one updater instance.
+    // Keep local Debug experiments from being replaced by an upstream
+    // release. A stopped updater also disables the manual update button.
+    // Release builds retain their normal automatic updates.
+    #if DEBUG
+    let updater = SPUStandardUpdaterController(
+        startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    #else
     let updater = SPUStandardUpdaterController(
         startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hand the updater to the control window, which is built outside the
@@ -220,11 +223,24 @@ final class SenderController: ObservableObject {
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
-    @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
+    @Published var port = UserDefaults.standard.string(forKey: "port") ?? String(ReceiverEndpoint.port)
     // `-mode mirror` / `-mode extend` launch argument also works.
-    @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
+    // The menu-bar popover and the standalone window both host ContentView.
+    // Restart here, once per actual setting change, rather than in each
+    // view's onChange: two observers used to tear down and start the same
+    // device twice, racing virtual-display creation and receiver connections.
+    @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend {
+        didSet {
+            guard mode != oldValue else { return }
+            restartAll()
+        }
+    }
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
-        didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
+        didSet {
+            guard quality != oldValue else { return }
+            UserDefaults.standard.set(quality.rawValue, forKey: "quality")
+            restartAll()
+        }
     }
 
     var running: Bool { !sessions.isEmpty }
@@ -811,7 +827,7 @@ final class SenderController: ObservableObject {
     }
 
     /// Mode/quality apply per-pipeline at construction — rebuild every session.
-    func restartAll() {
+    private func restartAll() {
         guard running else { return }
         let targets = sessions.map(\.target)
         sessions.forEach { $0.sender.stop() }
@@ -1028,7 +1044,6 @@ struct ContentView: View {
                     Text("Mirror").tag(CaptureMode.mirror)
                 }
                 .pickerStyle(.segmented)
-                .onChange(of: controller.mode) { controller.restartAll() }
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Quality", selection: $controller.quality) {
@@ -1036,7 +1051,6 @@ struct ContentView: View {
                             Text(q.label).tag(q)
                         }
                     }
-                    .onChange(of: controller.quality) { controller.restartAll() }
                     Text(controller.quality.explanation)
                         .font(.caption)
                         .foregroundStyle(.secondary)

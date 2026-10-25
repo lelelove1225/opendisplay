@@ -35,7 +35,7 @@ enum StreamQuality: String, CaseIterable {
         switch self {
         case .best: return "Highest safe detail for this sender and display."
         case .balanced: return "Lower capture resolution for less latency and bandwidth."
-        case .fast: return "Lowest latency and bandwidth, with a softer image. Good for WiFi."
+        case .fast: return "Prioritize responsiveness. On WiFi, compatible receivers adapt quality and limit queued frames."
         }
     }
 }

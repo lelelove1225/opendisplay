@@ -45,6 +45,7 @@ struct ReceiverScreen: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("fitEntireDesktop") private var fitEntireDesktop = false
     // First-run onboarding (issue #49): explain the Mac app is required.
     // Shown until either the user dismisses it or the device connects once.
     @AppStorage("hasConnectedBefore") private var hasConnectedBefore = false
@@ -69,7 +70,7 @@ struct ReceiverScreen: View {
     }
 
     var body: some View {
-        GeometryReader { geo in
+        GeometryReader { geometry in
             ZStack {
                 if isStreaming {
                     Color.black.ignoresSafeArea()
@@ -77,7 +78,7 @@ struct ReceiverScreen: View {
                                    receiver: model.receiver,
                                    useMetal: metalRenderer)
                         .id(metalRenderer)   // rebuild the layer tree on toggle
-                        .ignoresSafeArea()
+                        .ignoresSafeArea(edges: fitEntireDesktop ? [] : .all)
                     if showAnalytics {
                         VStack {
                             Spacer()
@@ -91,15 +92,21 @@ struct ReceiverScreen: View {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
             }
-            .onAppear { model.receiver.setOrientation(portrait: geo.size.height > geo.size.width) }
-            .onChange(of: geo.size) { size in
-                model.receiver.setOrientation(portrait: size.height > size.width)
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(ReceiverViewportReader(usesFullWindow: !fitEntireDesktop,
+                                               onChange: model.updateViewport))
+            .padding(fitEntireDesktop ? 8 : 0)
+            // Balance asymmetric safe-area insets around the whole window.
+            // The idle UI keeps its ordinary safe-area position.
+            .offset(x: fitEntireDesktop && isStreaming
+                    ? (geometry.safeAreaInsets.trailing - geometry.safeAreaInsets.leading) / 2 : 0,
+                    y: fitEntireDesktop && isStreaming
+                    ? (geometry.safeAreaInsets.bottom - geometry.safeAreaInsets.top) / 2 : 0)
             .sheet(isPresented: $showOnboarding) {
                 OnboardingView { onboardingDismissed = true }
             }
         }
-        .ignoresSafeArea(edges: isStreaming ? .all : [])
+        .background(Color.black.ignoresSafeArea())
         .statusBarHidden(isStreaming)
         .systemOverlaysHidden(isStreaming)
         .sheet(isPresented: $showSettings) {
@@ -337,6 +344,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("fitEntireDesktop") private var fitEntireDesktop = false
     // Set once the user tapped "Rate on the App Store": the row is an
     // invitation, not a permanent fixture.
     @AppStorage("rateAppTapped") private var rateAppTapped = false
@@ -364,7 +372,7 @@ struct SettingsView: View {
                 }
 
                 Section("Status") {
-                    LabeledRow("Listening", value: "Port 9000")
+                    LabeledRow("Listening", value: "Port \(ReceiverEndpoint.port)")
                     LabeledRow("Connection",
                                value: receiver.connected ? "Connected" : "Waiting for a computer")
                     if receiver.videoSize != .zero {
@@ -384,6 +392,14 @@ struct SettingsView: View {
                     Text("Name")
                 } footer: {
                     Text("Shown in the WiFi list of OpenDisplay on your computer. iOS hides this \(deviceKind)'s real name from apps, so set it here once.")
+                }
+
+                Section {
+                    Toggle("Fit entire desktop", isOn: $fitEntireDesktop)
+                } header: {
+                    Text("Display")
+                } footer: {
+                    Text("Off fills the screen edge to edge. On adds a small, centered margin to keep desktop corners visible. Changes apply immediately.")
                 }
 
                 Section {
@@ -540,51 +556,53 @@ private struct DeviceNameField: View {
 @MainActor
 final class ReceiverModel: ObservableObject {
     let receiver: StreamReceiver
+    private let decodesHEVC: Bool
     private var started = false
+    private var hasViewport = false
     private var cancellables = Set<AnyCancellable>()
 
     init() {
         // Offer HEVC wherever the hardware decodes it (A9 and later; the A8/A8X
         // iPads stay on H.264). Panels here fit H.264's raster anyway, so HEVC
         // buys quality per bit, which matters most over WiFi. Bounded by the
-        // panel in either orientation, so a large mirrored Mac display is
-        // scaled to what this screen can show instead of sent in full.
-        let native = UIScreen.main.nativeBounds.size   // portrait pixels
-        let longSide = Int(max(native.width, native.height))
+        // current window, which can move between Duo's two displays. The
+        // viewport reader supplies dimensions before the listener starts.
         var decodesHEVC = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
         #if DEBUG
         // The simulator has no hardware decoder; -forceHEVCOffer YES exercises
         // the HEVC receive path there with software decode.
         if UserDefaults.standard.bool(forKey: "forceHEVCOffer") { decodesHEVC = true }
         #endif
-        let hevc = decodesHEVC
-            ? VideoCapability(codec: "hevc", maxWidth: longSide, maxHeight: longSide,
-                              maxFrameRate: 60)
-            : nil
+        self.decodesHEVC = decodesHEVC
+        #if DEBUG
+        let defaultName = UIDevice.current.name + " Dev"
+        #else
+        let defaultName = UIDevice.current.name
+        #endif
         receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(),
                                   deviceKind: deviceKind,
-                                  fallbackServiceName: UIDevice.current.name,
-                                  hevcCapability: hevc)
-        // Announce the native panel size to the Mac.
-        receiver.setNativePanel(long: Int(max(native.width, native.height)),
-                                short: Int(min(native.width, native.height)),
-                                scale: Double(UIScreen.main.nativeScale))
-        receiver.setDisplayMaxFrameRate(UIScreen.main.maximumFramesPerSecond)
+                                  fallbackServiceName: defaultName)
         if let budget = DecodeBudget.maxPixelsPerSecond(model: DecodeBudget.currentModel) {
             receiver.setDecodeBudget(maxPixelsPerSecond: budget)
         }
         let savedName = UserDefaults.standard.string(forKey: "deviceName")
-        receiver.serviceName = (savedName?.isEmpty == false) ? savedName! : UIDevice.current.name
+        receiver.serviceName = (savedName?.isEmpty == false) ? savedName! : defaultName
         receiver.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
     }
 
+    func updateViewport(_ viewport: ReceiverViewport) {
+        receiver.setViewport(viewport, supportsHEVC: decodesHEVC)
+        hasViewport = true
+        start()
+    }
+
     func start() {
-        guard !started else { return }
+        guard hasViewport, !started else { return }
         started = true
-        receiver.start(port: 9000)
+        receiver.start(port: ReceiverEndpoint.port)
     }
 
     // MARK: - Lock vs app switch vs app quit
@@ -619,6 +637,7 @@ final class ReceiverModel: ObservableObject {
 
     func sceneDidActivate() {
         endBackgroundAssertion()
+        guard started else { return } // wait for the first real window size
         receiver.setRenderingPaused(false)
         receiver.ensureListening()
     }

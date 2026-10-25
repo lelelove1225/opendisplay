@@ -11,6 +11,8 @@ struct PhoneInfo: Decodable {
                           // across USB and WiFi
     let pv: Int?          // receiver protocol version (issue #132); absent on
                           // every pre-handshake install → treat as protocol 1
+    let videoDatagrams: Int? // optional deadline-limited UDP video
+    let frameAck: Int?    // version 1: cumulative video receipt feedback
     let cursorPort: Int?  // UDP port for the cursor side channel (PROTOCOL.md
                           // 6.3); absent = cursor stays on TCP
     let addrs: [String]?  // every address the receiver is reachable on

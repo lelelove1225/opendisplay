@@ -114,7 +114,11 @@ final class StreamReceiver: ObservableObject {
     var powerActions: [PowerAction] = []
     /// Called on the main thread once a power action passed the gate.
     var onPowerAction: ((PowerAction) -> Void)?
-    private var lastCursorSeq: UInt64 = 0
+    private var cursorSequence = CursorSequenceWindow()
+    private var videoAssembler: DeadlineVideoAssembler?
+    private var videoDatagramTimer: DispatchSourceTimer?
+    private var videoDatagramRecoveries = 0
+    private var staleVideoDatagrams = 0
     // Cursor channel health for the HUD/stats: how many positions landed and
     // how many datagrams never did (sequence gaps + reordered drops). A
     // stuttering pointer with a healthy count means the drawing side; a low
@@ -303,6 +307,25 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
+    /// iOS window geometry may change without a rotation (Duo fold/unfold or
+    /// Split View). Commit size, display rate and decoder limits together on
+    /// the connection queue, then announce one consistent operating envelope.
+    func setViewport(_ viewport: ReceiverViewport, supportsHEVC: Bool) {
+        queue.async {
+            let longSide = max(viewport.pixelsWide, viewport.pixelsHigh)
+            let hevc = supportsHEVC
+                ? VideoCapability(codec: "hevc", maxWidth: longSide, maxHeight: longSide,
+                                  maxFrameRate: 60)
+                : nil
+            let rateChanged = self.displayMaxFrameRate != viewport.maximumFramesPerSecond
+            self.displayMaxFrameRate = viewport.maximumFramesPerSecond
+            let limitsChanged = self.setDecodeLimits(maxEncodeWide: nil, maxEncodeHigh: nil,
+                                                    hevc: hevc)
+            self.setPanel(pixelsWide: viewport.pixelsWide, pixelsHigh: viewport.pixelsHigh,
+                          scale: viewport.scale, limitsChanged: limitsChanged || rateChanged)
+        }
+    }
+
     func setOrientation(portrait: Bool) {
         guard nativeLong > 0 else { return }
         setPanel(pixelsWide: portrait ? nativeShort : nativeLong,
@@ -311,7 +334,7 @@ final class StreamReceiver: ObservableObject {
     }
 
     /// Announce the panel this receiver renders onto. Called before start()
-    /// and again whenever it changes (iOS rotation via setOrientation, macOS
+    /// and again whenever it changes (iOS content viewport, macOS
     /// display-mode changes) — a live connection re-sends hello so the sender
     /// rebuilds the virtual display for the new dimensions.
     /// `panel` is announced as `hello.panel` when the legacy fields are not
@@ -409,6 +432,10 @@ final class StreamReceiver: ObservableObject {
     func ensureListening() {
         queue.async {
             guard !self.listenerHealthy else { return }
+            // Initial scene activation can follow start() before NWListener
+            // reports ready. Cancelling a binding socket here races its own
+            // replacement and produces a spurious address-in-use failure.
+            if let listener = self.listener, case .setup = listener.state { return }
             Log.info("listener not healthy — restarting")
             self.restartListener()
         }
@@ -418,6 +445,8 @@ final class StreamReceiver: ObservableObject {
     // (brief app switch): decoding is pointless and hardware decode sessions
     // fail off-screen, so frames are dropped before the sample stage.
     private var renderingPaused = false
+    private var decodeAdmission = VideoDecodeAdmission()
+    private var videoBackpressureDrops = 0
 
     /// Pause/resume the video sink around a background linger. Resuming
     /// flushes the layer and asks the Mac for a keyframe so the picture
@@ -429,6 +458,7 @@ final class StreamReceiver: ObservableObject {
             Log.info(paused ? "rendering paused (backgrounded)" : "rendering resumed")
             if !paused {
                 self.displayLayer.flush()
+                self.decodeAdmission = VideoDecodeAdmission()
                 if self.connection?.state == .ready {
                     self.sendControl(["type": "kf"])
                 }
@@ -516,10 +546,10 @@ final class StreamReceiver: ObservableObject {
             guard let self, self.cursorListener === udp else { conn.cancel(); return }
             // A UDP "connection" is one remote host:port flow. The newest
             // one is the live sender (a rebuilt sender socket gets a fresh
-            // ephemeral port) and starts its sequence over.
+            // ephemeral port). Sequence numbers persist for the TCP session.
             self.cursorConnection?.cancel()
             self.cursorConnection = conn
-            self.lastCursorSeq = 0
+            self.cursorSequence.newUDPFlow()
             conn.stateUpdateHandler = { [weak self] state in
                 guard let self, self.cursorConnection === conn else { return }
                 if case .failed(let error) = state {
@@ -559,6 +589,7 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func stopCursorListener() {
+        stopVideoDatagrams()
         cursorConnection?.cancel()
         cursorConnection = nil
         cursorListener?.cancel()
@@ -583,23 +614,26 @@ final class StreamReceiver: ObservableObject {
     /// reorder, and a stale position after a fresh one reads as jitter, so
     /// anything at or below the last seen sequence is dropped.
     private func handleCursorDatagram(_ data: Data) {
+        if data.starts(with: VideoDatagrams.magic) {
+            guard videoAssembler != nil else { return }
+            bytesThisWindow += data.count
+            let frames = videoAssembler!.receive(data, at: ProcessInfo.processInfo.systemUptime)
+            for frame in frames { handleAnnexB(frame.data, fromDatagram: true, datagramIsSync: frame.sync) }
+            return
+        }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               obj["type"] as? String == "cursor",
               let seq = (obj["s"] as? NSNumber)?.uint64Value else { return }
-        // Loss accounting only; the floor itself is enforced in applyCursor,
-        // shared with TCP. Counts run slightly hot during the brief window
-        // where the sender still mirrors to TCP (duplicates read as drops).
-        guard seq > lastCursorSeq else { cursorLostThisWindow += 1; return }
-        if lastCursorSeq == 0 {
-            // First datagram of this flow: tell the sender the channel truly
-            // delivers (UDP .ready proves only a local route — a firewalled
-            // port would otherwise eat the cursor forever, PROTOCOL.md 6.3).
+        let previous = cursorSequence.sequence
+        let result = cursorSequence.receive(seq, udp: true)
+        if result.acknowledge {
+            // Confirm even if TCP already delivered this mirrored position.
             Log.info("cursor channel: receiving datagrams")
             sendControl(["type": "cursorAck"])
-        } else {
-            cursorLostThisWindow += Int(seq - lastCursorSeq - 1)
         }
-        applyCursor(obj)
+        guard result.apply else { return }
+        if previous > 0 { cursorLostThisWindow += Int(min(seq - previous - 1, UInt64(Int.max))) }
+        applyCursor(obj, sequenceChecked: true)
     }
 
     private func startListener() {
@@ -715,7 +749,7 @@ final class StreamReceiver: ObservableObject {
         cursorConnection?.cancel()
         cursorConnection = nil
         resetStreamState()
-        lastCursorSeq = 0   // the sender restarts its cursor sequence per session
+        cursorSequence = CursorSequenceWindow()   // fresh TCP session
         cursorPortAnnounced = false
         // Hide the previous sender's cursor: replayed into a fresh video view
         // it would ghost over a new sender that never sends one (mirror mode
@@ -813,6 +847,29 @@ final class StreamReceiver: ObservableObject {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String else { return }
         switch type {
+        case "videoUDPStart":
+            guard let token = obj["flow"] as? String, UUID(uuidString: token) != nil,
+                  let codec = obj["codec"] as? String,
+                  codec == "h264" || (codec == "hevc" && hevcCapability != nil),
+                  cursorListenerReady, cursorConnection != nil else { return }
+            stopVideoDatagrams()
+            // This ordered TCP barrier follows all old TCP video. The sender
+            // waits for Ready before sending any UDP pictures.
+            streamCodec = codec
+            formatDesc = nil; vps = nil; sps = nil; pps = nil
+            decodeAdmission.invalidate()
+            videoAssembler = DeadlineVideoAssembler(token: token)
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + .milliseconds(8), repeating: .milliseconds(8))
+            timer.setEventHandler { [weak self] in self?.pollVideoDatagrams() }
+            timer.resume()
+            videoDatagramTimer = timer
+            Log.info("deadline UDP video ready: \(codec)")
+            sendControl(["type": "videoUDPReady", "flow": token])
+        case "videoUDPStop":
+            stopVideoDatagrams()
+            decodeAdmission.invalidate()
+            Log.info("deadline UDP video stopped — returning to TCP")
         case "pong":
             guard let t1 = obj["t"] as? Double, let mt = obj["mt"] as? Double else { return }
             let t2 = nowMs
@@ -876,6 +933,7 @@ final class StreamReceiver: ObservableObject {
             }
             if streamCodec != codec {
                 streamCodec = codec
+                decodeAdmission = VideoDecodeAdmission()
                 vps = nil
                 sps = nil
                 pps = nil
@@ -912,10 +970,9 @@ final class StreamReceiver: ObservableObject {
     /// channel switch a TCP frame queued behind video would otherwise land
     /// after (and override) a newer UDP position. Old senders put no `s` on
     /// TCP frames; those apply unconditionally, as before.
-    private func applyCursor(_ obj: [String: Any]) {
-        if let seq = (obj["s"] as? NSNumber)?.uint64Value {
-            guard seq > lastCursorSeq else { return }
-            lastCursorSeq = seq
+    private func applyCursor(_ obj: [String: Any], sequenceChecked: Bool = false) {
+        if !sequenceChecked, let seq = (obj["s"] as? NSNumber)?.uint64Value {
+            guard cursorSequence.receive(seq, udp: false).apply else { return }
         }
         let visible = (obj["v"] as? Int ?? 0) == 1
         let x = obj["x"] as? Double ?? 0
@@ -928,9 +985,14 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func resetStreamState() {
+        stopVideoDatagrams()
+        videoDatagramRecoveries = 0
+        staleVideoDatagrams = 0
         buffer.removeAll(keepingCapacity: true)
         formatDesc = nil
         streamCodec = "h264"
+        decodeAdmission = VideoDecodeAdmission()
+        videoBackpressureDrops = 0
         vps = nil
         sps = nil
         pps = nil
@@ -950,6 +1012,32 @@ final class StreamReceiver: ObservableObject {
         photonWindow.removeAll(keepingCapacity: true)
     }
 
+    private func stopVideoDatagrams() {
+        videoDatagramTimer?.cancel()
+        videoDatagramTimer = nil
+        videoAssembler = nil
+    }
+
+    private func sendVideoFeedback(_ object: [String: Any]) {
+        guard let conn = cursorConnection,
+              let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        conn.send(content: data, completion: .contentProcessed { _ in })
+    }
+
+    private func pollVideoDatagrams() {
+        guard videoAssembler != nil else { return }
+        let feedback = videoAssembler!.poll(at: ProcessInfo.processInfo.systemUptime)
+        let token = videoAssembler!.token
+        for nack in feedback.missing {
+            sendVideoFeedback(["type": "videoNack", "flow": token,
+                               "seq": nack.sequence, "missing": nack.indices])
+        }
+        if feedback.recover {
+            videoDatagramRecoveries += 1
+            sendVideoFeedback(["type": "videoRecover", "flow": token])
+        }
+    }
+
     // MARK: - Control messages (phone -> Mac)
 
     private func sendHello(on conn: NWConnection, includeCursorPort: Bool = true) {
@@ -962,6 +1050,7 @@ final class StreamReceiver: ObservableObject {
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
             "displayMaxFrameRate": displayMaxFrameRate,
+            "frameAck": 1,
         ]
         let panel = panelOverride ?? PanelAnnouncement(
             pixelsWide: devicePixelsWide, pixelsHigh: devicePixelsHigh, scale: deviceScale)
@@ -988,7 +1077,10 @@ final class StreamReceiver: ObservableObject {
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
         let announcesCursorPort = includeCursorPort && cursorListenerReady
-        if announcesCursorPort { hello["cursorPort"] = Int(cursorPort) }
+        if announcesCursorPort {
+            hello["cursorPort"] = Int(cursorPort)
+            hello["videoDatagrams"] = VideoDatagrams.version
+        }
         // Additive: decode ceiling (PROTOCOL.md 6.5) — ask for the full
         // desktop but a stream no larger than this machine can decode.
         if let maxEncodeWide, let maxEncodeHigh {
@@ -1161,7 +1253,8 @@ final class StreamReceiver: ObservableObject {
 
     // MARK: - Annex B -> CMSampleBuffer
 
-    private func handleAnnexB(_ data: Data) {
+    private func handleAnnexB(_ data: Data, fromDatagram: Bool = false,
+                              datagramIsSync: Bool = false) {
         // Pure JSON payload = control message (pong, cursor sprite etc.).
         // Video frames also begin with '{' (telemetry prefix) but always
         // contain start codes — the null bytes make them unambiguous even
@@ -1170,6 +1263,10 @@ final class StreamReceiver: ObservableObject {
             handleVideoChannelJSON(data)
             return
         }
+
+        // After the TCP start barrier, only the negotiated UDP flow carries
+        // video until an ordered stop barrier. Control JSON still uses TCP.
+        if videoAssembler != nil && !fromDatagram { return }
 
         // Split on 4-byte start codes (our sender only emits 00 00 00 01).
         // Bytes before the FIRST start code are the telemetry prefix
@@ -1197,12 +1294,39 @@ final class StreamReceiver: ObservableObject {
 
         var captureMs: Double?
         var sendMs: Double?
+        var receipt: [String: Any]?
         if let metaPrefix,
            let meta = try? JSONSerialization.jsonObject(with: metaPrefix) as? [String: Any] {
             captureMs = meta["cap"] as? Double
             sendMs = meta["snd"] as? Double
+            if let flow = meta["flow"] as? String, flow.count <= 64,
+               let seq = meta["seq"] as? UInt64, seq > 0 {
+                receipt = ["type": "frameAck", "flow": flow, "seq": seq]
+            }
+        }
+        // Receipt = parsed and submitted (or deliberately skipped), not a
+        // promise that these pixels have reached the panel. This reverse TCP
+        // direction is independent of the Mac's video send queue.
+        defer {
+            if let receipt {
+                if fromDatagram { sendVideoFeedback(receipt) }
+                else { sendControl(receipt) }
+            }
         }
 
+        if fromDatagram, let sendMs, let offset = clockOffsetMs {
+            let age = nowMs + offset - sendMs
+            let deadline = (datagramIsSync ? VideoDatagrams.syncDeadline : VideoDatagrams.deadline) * 1000
+            if age > deadline {
+                // These bytes may already have been queued in the OS/radio
+                // when the sender abandoned them. Do not display stale pixels
+                // just because every fragment eventually arrived.
+                staleVideoDatagrams += 1
+                decodeAdmission.invalidate()
+                requestKeyframeIfNeeded()
+                return
+            }
+        }
         var vclNALUs: [Data] = []
         for nalu in nalus {
             guard let first = nalu.first else { continue }
@@ -1245,7 +1369,12 @@ final class StreamReceiver: ObservableObject {
         }
         guard !vclNALUs.isEmpty else { return }
         // All slices of one wire frame go into ONE sample buffer.
-        enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
+        let sync = vclNALUs.contains { nalu in
+            guard let first = nalu.first else { return false }
+            if streamCodec == "hevc" { return (19...21).contains((first >> 1) & 0x3F) }
+            return first & 0x1F == 5
+        }
+        enqueueFrame(vclNALUs, isSync: sync, captureMs: captureMs, sendMs: sendMs)
     }
 
     private func buildFormatDescription(sps: Data, pps: Data) {
@@ -1318,12 +1447,27 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
-    private func enqueueFrame(_ nalus: [Data], captureMs: Double? = nil, sendMs: Double? = nil) {
-        guard let formatDesc else { return }
+    private func enqueueFrame(_ nalus: [Data], isSync: Bool,
+                              captureMs: Double? = nil, sendMs: Double? = nil) {
+        guard let formatDesc else { requestKeyframeIfNeeded(); return }
         // Backgrounded linger: hardware decode is off-limits there, so drop
         // frames at the door instead of feeding a failing display layer at
         // frame rate. setRenderingPaused(false) re-syncs with a keyframe.
         if renderingPaused { return }
+        let metal = useMetalPath && onDecodedFrame != nil
+        let failed = !metal && displayLayer.status == .failed
+        if failed {
+            decodeFlushes += 1
+            displayLayer.flush()
+        }
+        let decision = decodeAdmission.admit(isSync: isSync,
+            ready: metal || displayLayer.isReadyForMoreMediaData, failed: failed)
+        guard decision.accept else {
+            videoBackpressureDrops += 1
+            requestKeyframeIfNeeded()
+            return
+        }
+        if decision.flush && !metal { displayLayer.flush() }
 
         // Build one AVCC buffer: each NALU prefixed with 4-byte big-endian length.
         var avcc = Data(capacity: nalus.reduce(0) { $0 + $1.count + 4 })
@@ -1344,13 +1488,13 @@ final class StreamReceiver: ObservableObject {
                 customBlockSource: nil, offsetToData: 0,
                 dataLength: avcc.count, flags: 0,
                 blockBufferOut: &blockBuffer) == noErr,
-              let blockBuffer else { return }
+              let blockBuffer else { decodeAdmission.invalidate(); requestKeyframeIfNeeded(); return }
         let copyStatus = avcc.withUnsafeBytes { raw in
             CMBlockBufferReplaceDataBytes(
                 with: raw.baseAddress!, blockBuffer: blockBuffer,
                 offsetIntoDestination: 0, dataLength: avcc.count)
         }
-        guard copyStatus == noErr else { return }
+        guard copyStatus == noErr else { decodeAdmission.invalidate(); requestKeyframeIfNeeded(); return }
 
         var sample: CMSampleBuffer?
         var sizeArr = [avcc.count]
@@ -1363,7 +1507,7 @@ final class StreamReceiver: ObservableObject {
             sampleSizeEntryCount: 1, sampleSizeArray: &sizeArr,
             sampleBufferOut: &sample)
 
-        guard let sample else { return }
+        guard let sample else { decodeAdmission.invalidate(); requestKeyframeIfNeeded(); return }
         #if DEBUG
         idleFrameDumper?.push(sample)
         #endif
@@ -1384,11 +1528,6 @@ final class StreamReceiver: ObservableObject {
                     Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
             }
 
-            if displayLayer.status == .failed {
-                Log.info("display layer failed (\(String(describing: displayLayer.error))) — flushing")
-                decodeFlushes += 1
-                displayLayer.flush()
-            }
             displayLayer.enqueue(sample)
         }
 
@@ -1488,6 +1627,10 @@ final class StreamReceiver: ObservableObject {
                     "int95": percentile(frameIntervals, 0.95).rounded(),
                     "hitch": stats.hitches,
                     "codec": stats.codec,
+                    "decodeBackpressureDrops": videoBackpressureDrops,
+                    "udpRecoveries": videoDatagramRecoveries,
+                    "udpStaleDrops": staleVideoDatagrams,
+                    "videoTransport": videoAssembler == nil ? "tcp" : "udp",
                 ])
                 e2eWindow.removeAll(keepingCapacity: true)
                 encodeWindow.removeAll(keepingCapacity: true)

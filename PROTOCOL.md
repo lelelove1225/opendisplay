@@ -464,13 +464,15 @@ UDP where a lost or late datagram costs nothing: the next one supersedes it.
   queued behind video can arrive after a newer datagram). The sequence is
   per TCP session: it restarts when the TCP connection is (re-)established
   and runs across both paths. The receiver resets its tracker on every new
-  TCP connection and on every new UDP flow, and accepts datagrams only
-  from the most recently seen flow. A TCP `cursor` frame without `s` (an
+  TCP connection, preserves it across new UDP flows in that session, and
+  accepts datagrams only from the most recently seen flow. A TCP `cursor` frame without `s` (an
   older sender) applies unconditionally.
 * **Delivery confirmation.** `.ready` on a UDP socket proves only a local
   route — a firewalled port would swallow the cursor silently. On the
-  first accepted datagram of a flow the receiver sends `cursorAck` (a
-  control message with no other fields) over TCP. Until it arrives the
+  first well-formed datagram of a flow the receiver sends `cursorAck` (a
+  control message with no other fields) over TCP, even when TCP has already
+  delivered the same or a newer sequence. Delivery confirmation is independent
+  of the position deduplication rule. Until it arrives the
   sender MUST keep mirroring every position onto TCP (same `s`, so the
   receiver deduplicates); if no ack arrives within a few seconds the
   sender SHOULD drop the UDP flow and stay on TCP. A receiver that stops
@@ -650,6 +652,17 @@ sender can ask it to power off.
 
 ### 6.7 Panel facts (`hello.panel`)
 
+On iOS, these facts describe the entire receiving window in physical pixels,
+derived from its bounds and its window scene's screen scale. By default video
+extends edge to edge; the device's rounded corners can mask desktop corners.
+The optional "Fit entire desktop" setting instead reports the video view's
+safe-area size minus an 8-point margin, centered in the window. Toggling the
+setting updates the announced size on the existing connection. Facts are updated
+when the window moves between iPhone Duo's inner and outer displays, rotates,
+or resizes in Split View. The receiver coalesces animated geometry changes
+before sending one hello with matching panel and decode limits. Do not infer
+these transitions solely from portrait/landscape or cache `UIScreen.main`.
+
 The **sender decides the size of the extended desktop**: the user's
 keyboard and mouse are on the sender, so the user's choice lives there.
 The receiver reports facts only:
@@ -692,6 +705,128 @@ change for any of this: `streamConfig` announces the stream.
 
 In mirror sessions `panel` only bounds the stream; the desktop is the
 sender's own display.
+
+### 6.8 Interactive video receipts (fork extension, additive)
+
+A receiver may advertise `"frameAck":1` in `hello`. A sender must not wait
+for receipts unless the current connection advertises this exact version.
+Legacy receivers, USB/cable, and higher-quality presets keep their existing
+behavior. This fork enables the policy for **Fast over WiFi**.
+
+When enabled, the sender adds `flow` (a fresh UUID string per feedback
+session) and `seq` (a positive, strictly increasing integer) to the existing
+video telemetry prefix, before the first Annex B start code:
+
+```json
+{"cap":1234567890000,"snd":1234567890004,"flow":"example-session-token","seq":42}
+```
+
+After parsing and submitting that frame to the display path, the receiver
+replies on the existing reverse TCP channel:
+
+```json
+{"type":"frameAck","flow":"example-session-token","seq":42}
+```
+
+A deliberately skipped frame is also acknowledged (e.g. backgrounded app or
+an overloaded decoder). This is a **receipt**, not a decode-complete or
+on-screen timestamp. TCP preserves order, so receipts are cumulative. The
+sender ignores duplicate/future sequences and mismatched session tokens.
+Re-hello/rotation preserves the window; a new connection gets a fresh token.
+
+The Fast/WiFi policy allows at most two unacknowledged encoded frames. It
+skips captures **before encoding** while full and retains only the newest
+pixel buffer, including the final changed frame when capture goes idle.
+A receipt wakes that replay immediately, subject to the selected frame rate.
+No encoded P-frame is discarded merely to catch up.
+
+The bitrate starts at the smaller of the selected ceiling and 3 Mbps.
+Receipt RTT above 50 ms, or an outstanding receipt older than 80 ms, halves
+it at most once per 500 ms, down to 750 kbps (or the preset ceiling if lower).
+Thirty or more receipts below 25 ms across two healthy seconds allow a slow
+increase, capped at the preset ceiling. Idle time does not raise the rate.
+These are sender-monotonic round trips, requiring no clock synchronization.
+Two seconds without a video receipt redials the socket while retaining the
+virtual display. These thresholds are initial tuning, not measured latency
+guarantees or a substitute for congestion control at the transport layer.
+
+If the receiver's display queue refuses more data, it keeps the last image
+and skips dependent frames until a ready sync frame arrives, requesting `kf`
+with the existing rate limit. It never feeds P-frames that reference a skipped
+frame. `decodeBackpressureDrops` in `stats` counts these skips; sender logs add
+`ackFlight`, `ackMs`, and the target `bitrate` for diagnostics.
+
+This receipt policy also supplies the adaptive bitrate/credit accounting for
+UDP video below. TCP remains the compatibility fallback. Cursor positions use
+the existing independent UDP channel, with a 100 ms refresh of the final
+position/visibility to recover from a lost final datagram.
+
+### 6.9 Deadline-limited UDP video (fork extension, additive)
+
+A receiver with a ready cursor listener may also advertise
+`"videoDatagrams":1`. Fast/WiFi senders may use it only after `cursorAck`
+confirms the UDP flow. No additional public listener is opened.
+
+The sender sends `{"type":"videoUDPStart","flow":"<UUID>","codec":"hevc"}`
+(or `h264`) on TCP, then stops video submission until the receiver echoes
+`{"type":"videoUDPReady","flow":"<UUID>"}`. This TCP barrier follows all
+previous TCP video and selects the codec before UDP data can arrive. After the
+barrier, the receiver ignores TCP video but continues handling TCP control.
+The first UDP picture must be a sync frame including the parameter sets.
+Rotation/reconfiguration uses a fresh token and barrier. Old tokens are
+ignored; tokens separate sessions, they do not authenticate or encrypt them.
+
+Each video UDP datagram is at most 1200 bytes. All integers are big-endian:
+
+| Byte offset | Size | Field |
+|---|---|---|
+| 0 | 4 | ASCII `ODV1` |
+| 4 | 36 | Canonical ASCII UUID matching the negotiated flow |
+| 40 | 8 | Frame sequence, matching the telemetry prefix `seq` |
+| 48 | 4 | Whole payload byte count, 1..1048576 |
+| 52 | 2 | Zero-based fragment index |
+| 54 | 2 | Fragment count, exactly ceil(payload bytes / 1140) |
+| 56 | 1 | 1 for sync frame, 0 otherwise |
+| 57 | 3 | Reserved, all zero |
+| 60 | 1..1140 | Fragment of the existing telemetry + Annex B payload |
+
+The last fragment has exactly the remaining payload length; all other
+fragments are 1140 bytes. Invalid sizes/counts, foreign tokens and old
+sequences are rejected before allocation. At most three partial frames are
+held on the receiver. Completed dependent frames are delivered in sequence;
+a complete newer sync frame may supersede missing older frames immediately.
+
+`frameAck` travels as unframed JSON on the reverse UDP flow after reassembly
+and display submission/skip. For incomplete frames, the receiver requests
+`{"type":"videoNack","flow":"<UUID>","seq":42,"missing":[1,7]}` after
+8 ms, no more frequently than every 12 ms. Requests contain at most 64 indices.
+Retransmissions use the same paced queue, with at most one frame's worth of
+retry packets per frame. The sender keeps two frames at most and submits no
+more than three datagrams per millisecond (28.8 Mbps peak), with at most eight
+local sends pending; adaptive bitrate limits the average video rate.
+
+An unacknowledged delta frame expires 80 ms after submission; a sync frame
+has 250 ms. While a sync frame is unacknowledged, no dependent frame is encoded.
+This avoids repeatedly replacing recovery pictures during a radio stall.
+After expiry the sender discards the dependent chain, releases its credits,
+reduces bitrate, and encodes a sync frame from the latest captured pixels.
+VideoToolbox rate-control drops preserve the sync request and retry the latest
+pixels; a no-error/nil output is not treated as a dead encoder.
+The receiver uses the same 80/250 ms budgets from first fragment arrival,
+and, once clock synchronization is available, rejects completely reassembled
+pictures older than their send-time budget as well. Such skips are counted as
+`udpStaleDrops`, so low delivered-frame latency cannot hide missing pictures.
+It rejects dependent frames until a sync frame completes, and requests
+`{"type":"videoRecover","flow":"<UUID>"}` at most every 100 ms while
+waiting. No recovery requests are sent before the first UDP video packet.
+
+If negotiation takes over one second, or active UDP video produces no valid
+receipt for two seconds, the sender sends `{"type":"videoUDPStop"}` on TCP
+and falls back to bounded TCP with a fresh keyframe for the rest of that
+connection. Idle time alone does not trigger fallback. Reconnect starts a
+fresh negotiation. Receiver `stats` includes `videoTransport` and
+`udpRecoveries`; sender logs include `udpExpired`. These deadlines bound app
+queues, not physical radio outages or packets already inside the OS/network.
 
 ## 7. Coordinate spaces and units
 

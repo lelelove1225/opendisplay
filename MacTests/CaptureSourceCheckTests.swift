@@ -13,6 +13,62 @@ final class CaptureSourceCheckTests: XCTestCase {
         }
     }
 
+    /// Observed on an iPhone's 562x1000-point virtual display: SCK reported
+    /// 1000.0000000000001 for the height and triggered three capture restarts.
+    func testFractionalHeightFromScreenCaptureKitNeverTrips() {
+        var check = CaptureSourceCheck()
+        let expected = CGRect(x: -562, y: 0, width: 562, height: 1000)
+        let captured = CGRect(x: -562, y: 0, width: 562, height: 1000.0000000000001)
+
+        for second in 0..<10 {
+            XCTAssertFalse(check.frame(screenRect: captured, expected: expected,
+                                       now: t0 + Double(second)))
+        }
+    }
+
+    func testRoundingNoiseOnEveryComponentNeverTrips() {
+        let expected = CGRect(x: -562, y: -1000, width: 562, height: 1000)
+        for component in 0..<4 {
+            for error: CGFloat in [-0.0001, 0.0001] {
+                var values: [CGFloat] = [-562, -1000, 562, 1000]
+                values[component] += error
+                let captured = CGRect(x: values[0], y: values[1],
+                                      width: values[2], height: values[3])
+                var check = CaptureSourceCheck()
+                XCTAssertFalse(check.frame(screenRect: captured, expected: expected, now: t0))
+                XCTAssertFalse(check.frame(screenRect: captured, expected: expected, now: t0 + 2))
+            }
+        }
+    }
+
+    func testRoundingEquivalentFrameClearsPendingMismatch() {
+        var check = CaptureSourceCheck()
+        let expected = CGRect(x: -562, y: 0, width: 562, height: 1000)
+        let rounded = CGRect(x: -562, y: 0, width: 562, height: 1000.0000000000001)
+
+        XCTAssertFalse(check.frame(screenRect: pixel, expected: expected, now: t0))
+        XCTAssertFalse(check.frame(screenRect: rounded, expected: expected, now: t0 + 1))
+        XCTAssertFalse(check.frame(screenRect: pixel, expected: expected, now: t0 + 2))
+        XCTAssertTrue(check.frame(screenRect: pixel, expected: expected, now: t0 + 4))
+    }
+
+    /// Keep the wrong-display guard sensitive to real subpoint geometry
+    /// differences; rounding whole coordinates would hide these.
+    func testRealGeometryChangesStillTripOnEveryComponent() {
+        let expected = CGRect(x: -562, y: -1000, width: 562, height: 1000)
+        for component in 0..<4 {
+            for change: CGFloat in [-0.25, 0.25] {
+                var values: [CGFloat] = [-562, -1000, 562, 1000]
+                values[component] += change
+                let captured = CGRect(x: values[0], y: values[1],
+                                      width: values[2], height: values[3])
+                var check = CaptureSourceCheck()
+                XCTAssertFalse(check.frame(screenRect: captured, expected: expected, now: t0))
+                XCTAssertTrue(check.frame(screenRect: captured, expected: expected, now: t0 + 2))
+            }
+        }
+    }
+
     /// #391: after sleep the iMac's stream kept delivering the Pixel's display.
     func testSustainedOtherDisplayTripsOnce() {
         var check = CaptureSourceCheck()
